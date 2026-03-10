@@ -155,8 +155,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     # TODO: disabled on loongarch64 because the ggml-ci node lacks Python 3.8
     if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "loongarch64")
-        llama_build_and_test(test-json-schema-to-grammar.cpp   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
-        target_include_directories(test-json-schema-to-grammar PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    llama_build_and_test(test-json-schema-to-grammar.cpp   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    target_include_directories(test-json-schema-to-grammar PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     endif()
 
     if (NOT GGML_BACKEND_DL)
@@ -164,6 +164,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     endif()
 
     llama_build(test-gbnf-validator.cpp)
+    llama_build(test-moss-tts-delay-load.cpp)
 
     # build test-tokenizer-1-bpe target once and add many tests
     llama_build(test-tokenizer-1-bpe.cpp)
@@ -282,5 +283,4 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 
 llama_build_and_test(test-alloc.cpp)
 target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
-
 
