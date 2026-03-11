@@ -4,14 +4,18 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cmath>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <limits>
 #include <numeric>
 #include <random>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -31,6 +35,12 @@ constexpr llama_token MOSS_DELAY_DEFAULT_AUDIO_PAD_CODE = 1024;
 constexpr uint32_t MOSS_DELAY_DEFAULT_AUDIO_VOCAB_SIZE = 1024;
 constexpr int64_t MOSS_DELAY_INT64_MAX = std::numeric_limits<int64_t>::max();
 constexpr float MOSS_NEG_INF = -std::numeric_limits<float>::infinity();
+constexpr uint32_t MOSS_CODES_MAGIC = 0x53444f43; // "CODS"
+constexpr uint32_t MOSS_CODES_VERSION = 1;
+constexpr uint32_t MOSS_DECODE_REF_MAGIC = 0x4652444d; // "MDRF"
+constexpr uint32_t MOSS_DECODE_REF_VERSION = 1;
+constexpr uint32_t MOSS_GEN_REF_MAGIC = 0x4652474d; // "MGRF"
+constexpr uint32_t MOSS_GEN_REF_VERSION = 1;
 
 struct moss_sampling_config {
     float text_temperature = 1.5f;
@@ -63,6 +73,16 @@ struct moss_delay_config {
 struct moss_audio_segment {
     std::vector<llama_token> codes;
     size_t n_frames = 0;
+};
+
+struct moss_generation_audio {
+    std::vector<llama_token> delayed_codes;
+    size_t delayed_frames = 0;
+
+    std::vector<moss_audio_segment> segments;
+
+    std::vector<llama_token> raw_codes;
+    size_t raw_frames = 0;
 };
 
 struct moss_delay_state {
@@ -108,11 +128,92 @@ struct moss_delay_state {
 
 using moss_rng = std::mt19937;
 
+struct moss_codes_header {
+    uint32_t magic = MOSS_CODES_MAGIC;
+    uint32_t version = MOSS_CODES_VERSION;
+    uint32_t n_frames = 0;
+    uint32_t n_vq = 0;
+};
+
+struct moss_decode_ref_header {
+    uint32_t magic = MOSS_DECODE_REF_MAGIC;
+    uint32_t version = MOSS_DECODE_REF_VERSION;
+    uint32_t prompt_frames = 0;
+    uint32_t n_vq = 0;
+    uint32_t audio_pad_code = 0;
+    uint32_t packed_frames = 0;
+    uint32_t raw_frames = 0;
+};
+
+struct moss_generation_ref_header {
+    uint32_t magic = MOSS_GEN_REF_MAGIC;
+    uint32_t version = MOSS_GEN_REF_VERSION;
+    uint32_t prompt_frames = 0;
+    uint32_t n_vq = 0;
+    uint32_t audio_pad_code = 0;
+    uint32_t prompt_packed_frames = 0;
+    uint32_t raw_frames = 0;
+};
+
+static moss_generation_audio moss_decode_generation_audio(
+        const moss_delay_state & state,
+        size_t prompt_frames,
+        const moss_delay_config & cfg);
+
+static moss_generation_audio moss_decode_generation_audio(
+        const std::vector<llama_token> & packed_ids,
+        size_t prompt_frames,
+        const moss_delay_config & cfg);
+
+static bool moss_generate_from_ref(
+        const std::string & model_path,
+        const std::string & ref_path,
+        int32_t max_new_tokens,
+        const moss_sampling_config & sampling_cfg,
+        uint32_t seed,
+        const std::string & dump_raw_codes_path,
+        const std::string & python_bin,
+        const std::string & helper_script,
+        const std::string & encoder_onnx,
+        const std::string & decoder_onnx,
+        const std::string & wav_out,
+        bool use_gpu_audio);
+
 static void print_usage(int argc, char ** argv) {
     (void) argc;
     LOG("\nexample usage:\n");
     LOG("  %s -m model.gguf --print-delay-config\n", argv[0]);
+    LOG("  %s --decode-parity-ref decode.ref.bin\n", argv[0]);
     LOG("\n");
+}
+
+template <typename T>
+static void moss_read_exact(std::ifstream & in, T * data, size_t count, const char * what) {
+    in.read(reinterpret_cast<char *>(data), sizeof(T) * count);
+    if (!in) {
+        throw std::runtime_error(std::string("failed to read ") + what);
+    }
+}
+
+template <typename T>
+static void moss_write_exact(std::ofstream & out, const T * data, size_t count, const char * what) {
+    out.write(reinterpret_cast<const char *>(data), sizeof(T) * count);
+    if (!out) {
+        throw std::runtime_error(std::string("failed to write ") + what);
+    }
+}
+
+static std::string moss_shell_quote(const std::string & value) {
+    std::string out = "'";
+    for (char c : value) {
+        if (c == '\'') {
+            out += "'\\''";
+        } else {
+            out += c;
+        }
+    }
+    out += "'";
+    return out;
 }
 
 static bool parse_meta_i64(const llama_model * model, const char * key, int64_t & out) {
@@ -729,6 +830,462 @@ static std::vector<moss_audio_segment> moss_extract_audio_segments(
     return segments;
 }
 
+static std::vector<llama_token> moss_concat_audio_segments(
+        const std::vector<moss_audio_segment> & segments,
+        size_t n_vq,
+        size_t * out_frames = nullptr) {
+    size_t total_frames = 0;
+    size_t total_tokens = 0;
+    for (const auto & seg : segments) {
+        total_frames += seg.n_frames;
+        total_tokens += seg.codes.size();
+    }
+
+    std::vector<llama_token> out;
+    out.reserve(total_tokens);
+    for (const auto & seg : segments) {
+        GGML_ASSERT(seg.codes.size() == seg.n_frames * n_vq);
+        out.insert(out.end(), seg.codes.begin(), seg.codes.end());
+    }
+
+    if (out_frames != nullptr) {
+        *out_frames = total_frames;
+    }
+    return out;
+}
+
+static void moss_write_codes_file(
+        const std::string & path,
+        const std::vector<llama_token> & raw_codes,
+        size_t raw_frames,
+        const moss_delay_config & cfg) {
+    GGML_ASSERT(raw_codes.size() == raw_frames * cfg.n_vq);
+
+    std::ofstream out(path, std::ios::binary);
+    if (!out) {
+        throw std::runtime_error("failed to open codes file for writing: " + path);
+    }
+
+    moss_codes_header hdr;
+    hdr.n_frames = (uint32_t) raw_frames;
+    hdr.n_vq = cfg.n_vq;
+
+    moss_write_exact(out, &hdr, 1, "codes header");
+    moss_write_exact(out, raw_codes.data(), raw_codes.size(), "codes payload");
+}
+
+static int moss_run_audio_decoder_helper(
+        const std::string & python_bin,
+        const std::string & helper_script,
+        const std::string & codes_path,
+        const std::string & wav_path,
+        const std::string & encoder_onnx,
+        const std::string & decoder_onnx,
+        bool use_gpu_audio) {
+    std::ostringstream cmd;
+    cmd
+        << moss_shell_quote(python_bin) << " "
+        << moss_shell_quote(helper_script)
+        << " --codes-bin " << moss_shell_quote(codes_path)
+        << " --wav-out " << moss_shell_quote(wav_path)
+        << " --encoder-onnx " << moss_shell_quote(encoder_onnx)
+        << " --decoder-onnx " << moss_shell_quote(decoder_onnx);
+    if (!use_gpu_audio) {
+        cmd << " --cpu";
+    }
+
+    LOG("running audio decoder helper: %s\n", cmd.str().c_str());
+    return std::system(cmd.str().c_str());
+}
+
+static bool moss_decode_parity(
+        const std::string & ref_path,
+        const std::string & dump_codes_path,
+        const std::string & python_bin,
+        const std::string & helper_script,
+        const std::string & encoder_onnx,
+        const std::string & decoder_onnx,
+        const std::string & wav_out,
+        bool use_gpu_audio) {
+    std::ifstream in(ref_path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("failed to open decode parity reference: " + ref_path);
+    }
+
+    moss_decode_ref_header hdr;
+    moss_read_exact(in, &hdr, 1, "decode parity header");
+    if (hdr.magic != MOSS_DECODE_REF_MAGIC || hdr.version != MOSS_DECODE_REF_VERSION) {
+        throw std::runtime_error("unexpected decode parity reference format");
+    }
+
+    moss_delay_config cfg;
+    cfg.n_vq = hdr.n_vq;
+    cfg.audio_pad_code = (llama_token) hdr.audio_pad_code;
+
+    std::vector<llama_token> packed_ids((size_t) hdr.packed_frames * cfg.packed_stride());
+    std::vector<llama_token> ref_raw_codes((size_t) hdr.raw_frames * cfg.n_vq);
+    moss_read_exact(in, packed_ids.data(), packed_ids.size(), "packed ids");
+    moss_read_exact(in, ref_raw_codes.data(), ref_raw_codes.size(), "reference raw codes");
+
+    const moss_generation_audio decoded = moss_decode_generation_audio(packed_ids, hdr.prompt_frames, cfg);
+
+    size_t mismatch_count = 0;
+    const size_t compare_count = std::min(decoded.raw_codes.size(), ref_raw_codes.size());
+    for (size_t i = 0; i < compare_count; ++i) {
+        if (decoded.raw_codes[i] != ref_raw_codes[i]) {
+            ++mismatch_count;
+        }
+    }
+    mismatch_count += decoded.raw_codes.size() > ref_raw_codes.size()
+            ? decoded.raw_codes.size() - ref_raw_codes.size()
+            : ref_raw_codes.size() - decoded.raw_codes.size();
+
+    LOG("moss-tts delay decode parity: prompt_frames=%u delayed_frames=%zu raw_frames=%zu ref_raw_frames=%u mismatch_count=%zu segments=%zu\n",
+            hdr.prompt_frames,
+            decoded.delayed_frames,
+            decoded.raw_frames,
+            hdr.raw_frames,
+            mismatch_count,
+            decoded.segments.size());
+
+    if (!dump_codes_path.empty()) {
+        moss_write_codes_file(dump_codes_path, decoded.raw_codes, decoded.raw_frames, cfg);
+    }
+
+    if (!helper_script.empty()) {
+        if (dump_codes_path.empty()) {
+            throw std::runtime_error("--audio-decoder-script requires --dump-raw-codes");
+        }
+        if (wav_out.empty()) {
+            throw std::runtime_error("--audio-decoder-script requires --wav-out");
+        }
+        if (encoder_onnx.empty() || decoder_onnx.empty()) {
+            throw std::runtime_error("--audio-decoder-script requires both --audio-encoder-onnx and --audio-decoder-onnx");
+        }
+
+        const int rc = moss_run_audio_decoder_helper(
+                python_bin, helper_script, dump_codes_path, wav_out,
+                encoder_onnx, decoder_onnx, use_gpu_audio);
+        if (rc != 0) {
+            throw std::runtime_error("audio decoder helper failed with exit code " + std::to_string(rc));
+        }
+    }
+
+    return mismatch_count == 0;
+}
+
+static llama_batch moss_batch_from_packed_rows(
+        const std::vector<llama_token> & packed_ids,
+        size_t start_frame,
+        size_t n_frames,
+        const moss_delay_config & cfg,
+        size_t pos_start,
+        bool output_last) {
+    GGML_ASSERT(cfg.n_vq > 0);
+    GGML_ASSERT(packed_ids.size() % cfg.packed_stride() == 0);
+    GGML_ASSERT(start_frame + n_frames <= packed_ids.size() / cfg.packed_stride());
+
+    llama_batch batch = llama_batch_init((int32_t) n_frames, 0, 1);
+    batch.n_tokens = (int32_t) n_frames;
+    batch.n_token_audio = (int32_t) cfg.n_vq;
+    batch.token_audio = (llama_token *) std::malloc(sizeof(llama_token) * n_frames * cfg.n_vq);
+    if (batch.token_audio == nullptr) {
+        throw std::runtime_error("failed to allocate token_audio");
+    }
+
+    for (size_t i = 0; i < n_frames; ++i) {
+        const size_t row = (start_frame + i) * cfg.packed_stride();
+        batch.token[i] = packed_ids[row + 0];
+        std::memcpy(
+                batch.token_audio + i * cfg.n_vq,
+                packed_ids.data() + row + 1,
+                sizeof(llama_token) * cfg.n_vq);
+        batch.pos[i] = (llama_pos) (pos_start + i);
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i] = output_last && (i + 1 == n_frames);
+    }
+
+    return batch;
+}
+
+static bool moss_generate_from_ref(
+        const std::string & model_path,
+        const std::string & ref_path,
+        int32_t max_new_tokens,
+        const moss_sampling_config & sampling_cfg,
+        uint32_t seed,
+        const std::string & dump_raw_codes_path,
+        const std::string & python_bin,
+        const std::string & helper_script,
+        const std::string & encoder_onnx,
+        const std::string & decoder_onnx,
+        const std::string & wav_out,
+        bool use_gpu_audio) {
+    std::ifstream in(ref_path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("failed to open generation reference: " + ref_path);
+    }
+
+    moss_generation_ref_header hdr;
+    moss_read_exact(in, &hdr, 1, "generation reference header");
+    if (hdr.magic != MOSS_GEN_REF_MAGIC || hdr.version != MOSS_GEN_REF_VERSION) {
+        throw std::runtime_error("unexpected generation reference format");
+    }
+
+    moss_delay_config cfg;
+    cfg.n_vq = hdr.n_vq;
+    cfg.audio_pad_code = (llama_token) hdr.audio_pad_code;
+
+    std::vector<llama_token> prompt_packed((size_t) hdr.prompt_packed_frames * cfg.packed_stride());
+    std::vector<llama_token> ref_raw_codes((size_t) hdr.raw_frames * cfg.n_vq);
+    moss_read_exact(in, prompt_packed.data(), prompt_packed.size(), "prompt packed ids");
+    moss_read_exact(in, ref_raw_codes.data(), ref_raw_codes.size(), "reference raw codes");
+
+    llama_backend_init();
+
+    llama_model_params mparams = llama_model_default_params();
+    mparams.use_mmap = true;
+
+    llama_model * model = llama_model_load_from_file(model_path.c_str(), mparams);
+    if (model == nullptr) {
+        llama_backend_free();
+        throw std::runtime_error("failed to load model: " + model_path);
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int32_t text_vocab = llama_vocab_n_tokens(vocab);
+    const moss_delay_config model_cfg = moss_delay_config_from_model(model);
+
+    if (model_cfg.n_vq != cfg.n_vq) {
+        llama_model_free(model);
+        llama_backend_free();
+        throw std::runtime_error("generation reference n_vq does not match model metadata");
+    }
+    cfg.audio_vocab_size = model_cfg.audio_vocab_size;
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx = std::max<uint32_t>((uint32_t) hdr.prompt_frames + (uint32_t) max_new_tokens + 8u, 64u);
+    cparams.n_batch = std::max<uint32_t>((uint32_t) hdr.prompt_frames, 1u);
+    cparams.n_ubatch = cparams.n_batch;
+    cparams.n_seq_max = 1;
+    cparams.embeddings = false;
+    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cparams.type_k = GGML_TYPE_F32;
+    cparams.type_v = GGML_TYPE_F32;
+
+    llama_context * ctx = llama_init_from_model(model, cparams);
+    if (ctx == nullptr) {
+        llama_model_free(model);
+        llama_backend_free();
+        throw std::runtime_error("failed to create context");
+    }
+
+    llama_set_warmup(ctx, false);
+    llama_set_causal_attn(ctx, true);
+    llama_set_embeddings(ctx, false);
+
+    {
+        llama_batch batch = moss_batch_from_packed_rows(prompt_packed, 0, hdr.prompt_frames, cfg, 0, true);
+        const int ret = llama_decode(ctx, batch);
+        llama_batch_free(batch);
+        if (ret != 0) {
+            llama_free(ctx);
+            llama_model_free(model);
+            llama_backend_free();
+            throw std::runtime_error("prefill llama_decode failed: " + std::to_string(ret));
+        }
+    }
+
+    moss_delay_state state = moss_init_delay_state(prompt_packed, cfg);
+    std::vector<llama_token> generated_packed;
+    generated_packed.reserve((size_t) max_new_tokens * cfg.packed_stride());
+
+    const size_t audio_vocab = moss_audio_vocab_with_pad(cfg);
+    moss_rng rng(seed);
+
+    for (int32_t step = 0; step < max_new_tokens; ++step) {
+        const float * logits = llama_get_logits_ith(ctx, -1);
+        if (logits == nullptr) {
+            llama_free(ctx);
+            llama_model_free(model);
+            llama_backend_free();
+            throw std::runtime_error("llama_get_logits_ith returned null");
+        }
+
+        std::vector<float> text_logits(logits, logits + text_vocab);
+        std::vector<float> audio_logits(
+                logits + text_vocab,
+                logits + text_vocab + cfg.n_vq * audio_vocab);
+
+        const std::vector<llama_token> next = moss_delay_step(
+                state, text_logits, audio_logits, sampling_cfg, cfg, rng);
+        generated_packed.insert(generated_packed.end(), next.begin(), next.end());
+
+        llama_batch batch = moss_batch_from_packed_rows(
+                generated_packed, generated_packed.size() / cfg.packed_stride() - 1, 1, cfg,
+                hdr.prompt_frames + (size_t) step, true);
+        const int ret = llama_decode(ctx, batch);
+        llama_batch_free(batch);
+        if (ret != 0) {
+            llama_free(ctx);
+            llama_model_free(model);
+            llama_backend_free();
+            throw std::runtime_error("generation llama_decode failed: " + std::to_string(ret));
+        }
+
+        if (state.is_stopping) {
+            break;
+        }
+    }
+
+    const moss_generation_audio decoded = moss_decode_generation_audio(state, hdr.prompt_frames, cfg);
+
+    size_t mismatch_count = 0;
+    const size_t compare_count = std::min(decoded.raw_codes.size(), ref_raw_codes.size());
+    size_t first_mismatch = compare_count;
+    for (size_t i = 0; i < compare_count; ++i) {
+        if (decoded.raw_codes[i] != ref_raw_codes[i]) {
+            if (first_mismatch == compare_count) {
+                first_mismatch = i;
+            }
+            ++mismatch_count;
+        }
+    }
+    mismatch_count += decoded.raw_codes.size() > ref_raw_codes.size()
+            ? decoded.raw_codes.size() - ref_raw_codes.size()
+            : ref_raw_codes.size() - decoded.raw_codes.size();
+
+    LOG("moss-tts first-class generation parity: prompt_frames=%u generated_frames=%zu raw_frames=%zu ref_raw_frames=%u mismatch_count=%zu\n",
+            hdr.prompt_frames,
+            generated_packed.size() / cfg.packed_stride(),
+            decoded.raw_frames,
+            hdr.raw_frames,
+            mismatch_count);
+    if (first_mismatch != compare_count) {
+        LOG("first mismatch at raw_token=%zu got=%d ref=%d\n",
+                first_mismatch,
+                (int) decoded.raw_codes[first_mismatch],
+                (int) ref_raw_codes[first_mismatch]);
+    }
+
+    if (!dump_raw_codes_path.empty()) {
+        moss_write_codes_file(dump_raw_codes_path, decoded.raw_codes, decoded.raw_frames, cfg);
+    }
+
+    if (!helper_script.empty()) {
+        if (dump_raw_codes_path.empty()) {
+            llama_free(ctx);
+            llama_model_free(model);
+            llama_backend_free();
+            throw std::runtime_error("--audio-decoder-script requires --dump-raw-codes");
+        }
+        if (wav_out.empty()) {
+            llama_free(ctx);
+            llama_model_free(model);
+            llama_backend_free();
+            throw std::runtime_error("--audio-decoder-script requires --wav-out");
+        }
+        if (encoder_onnx.empty() || decoder_onnx.empty()) {
+            llama_free(ctx);
+            llama_model_free(model);
+            llama_backend_free();
+            throw std::runtime_error("--audio-decoder-script requires both ONNX paths");
+        }
+
+        const int rc = moss_run_audio_decoder_helper(
+                python_bin, helper_script, dump_raw_codes_path, wav_out,
+                encoder_onnx, decoder_onnx, use_gpu_audio);
+        if (rc != 0) {
+            llama_free(ctx);
+            llama_model_free(model);
+            llama_backend_free();
+            throw std::runtime_error("audio decoder helper failed with exit code " + std::to_string(rc));
+        }
+    }
+
+    llama_free(ctx);
+    llama_model_free(model);
+    llama_backend_free();
+
+    return mismatch_count == 0;
+}
+
+static std::vector<llama_token> moss_audio_history_slice(
+        const moss_delay_state & state,
+        size_t start_frame,
+        size_t * out_frames = nullptr) {
+    const size_t total_frames = state.audio_frames();
+    if (start_frame >= total_frames) {
+        if (out_frames != nullptr) {
+            *out_frames = 0;
+        }
+        return {};
+    }
+
+    const size_t n_frames = total_frames - start_frame;
+    std::vector<llama_token> out;
+    out.reserve(n_frames * state.n_vq);
+    out.insert(
+            out.end(),
+            state.audio_history.begin() + start_frame * state.n_vq,
+            state.audio_history.end());
+
+    if (out_frames != nullptr) {
+        *out_frames = n_frames;
+    }
+
+    return out;
+}
+
+static moss_generation_audio moss_decode_generation_audio(
+        const moss_delay_state & state,
+        size_t prompt_frames,
+        const moss_delay_config & cfg) {
+    GGML_ASSERT(state.n_vq == cfg.n_vq);
+
+    moss_generation_audio out;
+    out.delayed_codes = moss_audio_history_slice(state, prompt_frames, &out.delayed_frames);
+    if (out.delayed_frames == 0) {
+        return out;
+    }
+
+    out.segments = moss_extract_audio_segments(out.delayed_codes, out.delayed_frames, cfg);
+    out.raw_codes = moss_concat_audio_segments(out.segments, cfg.n_vq, &out.raw_frames);
+    return out;
+}
+
+static moss_generation_audio moss_decode_generation_audio(
+        const std::vector<llama_token> & packed_ids,
+        size_t prompt_frames,
+        const moss_delay_config & cfg) {
+    GGML_ASSERT(cfg.n_vq > 0);
+    GGML_ASSERT(packed_ids.size() % cfg.packed_stride() == 0);
+
+    const size_t total_frames = packed_ids.size() / cfg.packed_stride();
+    GGML_ASSERT(prompt_frames <= total_frames);
+
+    moss_generation_audio out;
+    out.delayed_frames = total_frames - prompt_frames;
+    out.delayed_codes.reserve(out.delayed_frames * cfg.n_vq);
+
+    for (size_t t = prompt_frames; t < total_frames; ++t) {
+        const size_t row = t * cfg.packed_stride();
+        out.delayed_codes.insert(
+                out.delayed_codes.end(),
+                packed_ids.begin() + row + 1,
+                packed_ids.begin() + row + 1 + cfg.n_vq);
+    }
+
+    if (out.delayed_frames == 0) {
+        return out;
+    }
+
+    out.segments = moss_extract_audio_segments(out.delayed_codes, out.delayed_frames, cfg);
+    out.raw_codes = moss_concat_audio_segments(out.segments, cfg.n_vq, &out.raw_frames);
+    return out;
+}
+
 static std::string moss_delay_config_to_string(const moss_delay_config & cfg) {
     std::ostringstream oss;
     oss
@@ -865,6 +1422,87 @@ static bool moss_delay_self_test() {
         }
     }
 
+    {
+        moss_delay_config decode_cfg = cfg;
+        decode_cfg.n_vq = 3;
+        decode_cfg.audio_pad_code = 99;
+
+        const std::vector<llama_token> prompt_audio = {
+            77, 99, 99,
+            88, 66, 99,
+        };
+        const std::vector<llama_token> raw_codes = {
+            10, 11, 12,
+            20, 21, 22,
+            30, 31, 32,
+        };
+        const std::vector<llama_token> delayed = moss_apply_delay_pattern(raw_codes, 3, decode_cfg);
+
+        moss_delay_state decode_state;
+        decode_state.n_vq = decode_cfg.n_vq;
+        decode_state.audio_history = prompt_audio;
+        decode_state.append_audio(delayed.data() + 0 * decode_cfg.n_vq);
+        decode_state.append_audio(delayed.data() + 1 * decode_cfg.n_vq);
+        decode_state.append_audio(delayed.data() + 2 * decode_cfg.n_vq);
+        decode_state.append_audio(delayed.data() + 3 * decode_cfg.n_vq);
+        decode_state.append_audio(delayed.data() + 4 * decode_cfg.n_vq);
+
+        const moss_generation_audio decoded = moss_decode_generation_audio(decode_state, 2, decode_cfg);
+        if (decoded.delayed_frames != 5 || decoded.raw_frames != 3 || decoded.raw_codes != raw_codes) {
+            return false;
+        }
+        if (decoded.segments.size() != 1 || decoded.segments[0].n_frames != 3 || decoded.segments[0].codes != raw_codes) {
+            return false;
+        }
+    }
+
+    {
+        moss_delay_config decode_cfg = cfg;
+        decode_cfg.n_vq = 3;
+        decode_cfg.audio_pad_code = 99;
+
+        const std::vector<llama_token> raw_a = {
+            10, 11, 12,
+            20, 21, 22,
+        };
+        const std::vector<llama_token> raw_b = {
+            40, 41, 42,
+        };
+        const std::vector<llama_token> delayed_a = moss_apply_delay_pattern(raw_a, 2, decode_cfg);
+        const std::vector<llama_token> delayed_b = moss_apply_delay_pattern(raw_b, 1, decode_cfg);
+
+        std::vector<llama_token> packed = {
+            100, 99, 99, 99,
+            101, 99, 99, 99,
+        };
+        auto append_delayed_rows = [&](llama_token text_token, const std::vector<llama_token> & delayed_rows, size_t n_frames) {
+            for (size_t t = 0; t < n_frames; ++t) {
+                packed.push_back(text_token);
+                packed.insert(
+                        packed.end(),
+                        delayed_rows.begin() + t * decode_cfg.n_vq,
+                        delayed_rows.begin() + (t + 1) * decode_cfg.n_vq);
+            }
+        };
+        append_delayed_rows(200, delayed_a, 4);
+        packed.push_back(201);
+        packed.insert(packed.end(), {99, 99, 99});
+        append_delayed_rows(202, delayed_b, 3);
+
+        const moss_generation_audio decoded = moss_decode_generation_audio(packed, 2, decode_cfg);
+        const std::vector<llama_token> raw_expected = {
+            10, 11, 12,
+            20, 21, 22,
+            40, 41, 42,
+        };
+        if (decoded.segments.size() != 2 || decoded.raw_frames != 3 || decoded.raw_codes != raw_expected) {
+            return false;
+        }
+        if (decoded.segments[0].codes != raw_a || decoded.segments[1].codes != raw_b) {
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -872,13 +1510,97 @@ static bool moss_delay_self_test() {
 
 int main(int argc, char ** argv) {
     std::string model_path;
+    std::string decode_parity_ref_path;
+    std::string generation_ref_path;
+    std::string dump_raw_codes_path;
+    std::string audio_decoder_script;
+    std::string audio_encoder_onnx;
+    std::string audio_decoder_onnx;
+    std::string wav_out_path;
+    std::string python_bin = "python";
     bool print_delay_config = false;
     bool self_test = false;
+    bool use_gpu_audio = true;
+    int32_t max_new_tokens = 2048;
+    uint32_t seed = 1234;
+    moss_sampling_config sampling_cfg;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if ((arg == "-m" || arg == "--model") && i + 1 < argc) {
             model_path = argv[++i];
+            continue;
+        }
+        if (arg == "--generation-ref" && i + 1 < argc) {
+            generation_ref_path = argv[++i];
+            continue;
+        }
+        if (arg == "--decode-parity-ref" && i + 1 < argc) {
+            decode_parity_ref_path = argv[++i];
+            continue;
+        }
+        if (arg == "--max-new-tokens" && i + 1 < argc) {
+            max_new_tokens = std::stoi(argv[++i]);
+            continue;
+        }
+        if (arg == "--seed" && i + 1 < argc) {
+            seed = (uint32_t) std::stoul(argv[++i]);
+            continue;
+        }
+        if (arg == "--dump-raw-codes" && i + 1 < argc) {
+            dump_raw_codes_path = argv[++i];
+            continue;
+        }
+        if (arg == "--audio-decoder-script" && i + 1 < argc) {
+            audio_decoder_script = argv[++i];
+            continue;
+        }
+        if (arg == "--audio-encoder-onnx" && i + 1 < argc) {
+            audio_encoder_onnx = argv[++i];
+            continue;
+        }
+        if (arg == "--audio-decoder-onnx" && i + 1 < argc) {
+            audio_decoder_onnx = argv[++i];
+            continue;
+        }
+        if (arg == "--wav-out" && i + 1 < argc) {
+            wav_out_path = argv[++i];
+            continue;
+        }
+        if (arg == "--python-bin" && i + 1 < argc) {
+            python_bin = argv[++i];
+            continue;
+        }
+        if (arg == "--text-temperature" && i + 1 < argc) {
+            sampling_cfg.text_temperature = std::stof(argv[++i]);
+            continue;
+        }
+        if (arg == "--text-top-p" && i + 1 < argc) {
+            sampling_cfg.text_top_p = std::stof(argv[++i]);
+            continue;
+        }
+        if (arg == "--text-top-k" && i + 1 < argc) {
+            sampling_cfg.text_top_k = std::stoi(argv[++i]);
+            continue;
+        }
+        if (arg == "--audio-temperature" && i + 1 < argc) {
+            sampling_cfg.audio_temperature = std::stof(argv[++i]);
+            continue;
+        }
+        if (arg == "--audio-top-p" && i + 1 < argc) {
+            sampling_cfg.audio_top_p = std::stof(argv[++i]);
+            continue;
+        }
+        if (arg == "--audio-top-k" && i + 1 < argc) {
+            sampling_cfg.audio_top_k = std::stoi(argv[++i]);
+            continue;
+        }
+        if (arg == "--audio-repetition-penalty" && i + 1 < argc) {
+            sampling_cfg.audio_repetition_penalty = std::stof(argv[++i]);
+            continue;
+        }
+        if (arg == "--audio-decoder-cpu") {
+            use_gpu_audio = false;
             continue;
         }
         if (arg == "--print-delay-config") {
@@ -907,12 +1629,58 @@ int main(int argc, char ** argv) {
         LOG("moss delay state self-test: ok\n");
     }
 
+    if (!generation_ref_path.empty()) {
+        if (model_path.empty()) {
+            LOG_ERR("--generation-ref requires -m <model.gguf>\n");
+            return EXIT_FAILURE;
+        }
+        try {
+            const bool ok = moss_generate_from_ref(
+                    model_path,
+                    generation_ref_path,
+                    max_new_tokens,
+                    sampling_cfg,
+                    seed,
+                    dump_raw_codes_path,
+                    python_bin,
+                    audio_decoder_script,
+                    audio_encoder_onnx,
+                    audio_decoder_onnx,
+                    wav_out_path,
+                    use_gpu_audio);
+            return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+        } catch (const std::exception & err) {
+            LOG_ERR("generation parity failed: %s\n", err.what());
+            return EXIT_FAILURE;
+        }
+    }
+
+    if (!decode_parity_ref_path.empty()) {
+        try {
+            const bool ok = moss_decode_parity(
+                    decode_parity_ref_path,
+                    dump_raw_codes_path,
+                    python_bin,
+                    audio_decoder_script,
+                    audio_encoder_onnx,
+                    audio_decoder_onnx,
+                    wav_out_path,
+                    use_gpu_audio);
+            return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+        } catch (const std::exception & err) {
+            LOG_ERR("decode parity failed: %s\n", err.what());
+            return EXIT_FAILURE;
+        }
+    }
+
     if (!print_delay_config) {
         if (self_test) {
             return EXIT_SUCCESS;
         }
-        LOG("moss delay state and multi-head sampler are in place; audio decode is not implemented yet.\n");
+        LOG("moss delay state, multi-head sampler, and raw-code decode are in place; audio decode is available via the external Python/ONNX helper.\n");
         LOG("use --print-delay-config with -m <model.gguf> to inspect model metadata.\n");
+        LOG("use --decode-parity-ref <ref.bin> to verify C++ de-delay/raw-code extraction against Python.\n");
+        LOG("use --generation-ref <ref.bin> -m <first-class-model.gguf> to verify end-to-end first-class generation against Python.\n");
         return EXIT_SUCCESS;
     }
 
