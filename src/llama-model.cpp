@@ -7669,6 +7669,14 @@ size_t llama_model::n_devices() const {
     return devices.size();
 }
 
+uint32_t llama_model::n_logits() const {
+    if (arch == LLM_ARCH_MOSS_TTS_DELAY) {
+        return vocab.n_tokens() + hparams.n_vq * (hparams.audio_vocab_size + 1);
+    }
+
+    return vocab.n_tokens();
+}
+
 uint32_t llama_model::n_gpu_layers() const {
     return params.n_gpu_layers >= 0 ? params.n_gpu_layers : hparams.n_layer + 1;
 }
@@ -8266,6 +8274,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
         case LLM_ARCH_QWEN3:
             {
                 llm = std::make_unique<llm_build_qwen3>(*this, params);
+            } break;
+        case LLM_ARCH_MOSS_TTS_DELAY:
+            {
+                llm = std::make_unique<llm_build_moss_tts_delay>(*this, params);
             } break;
         case LLM_ARCH_QWEN3MOE:
             {

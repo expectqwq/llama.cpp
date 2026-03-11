@@ -536,6 +536,7 @@ struct llama_model {
     size_t size() const; // file size
     size_t n_tensors() const;
     size_t n_devices() const;
+    uint32_t n_logits() const;
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;

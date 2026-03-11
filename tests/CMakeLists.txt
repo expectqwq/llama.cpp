@@ -165,6 +165,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_build(test-gbnf-validator.cpp)
     llama_build(test-moss-tts-delay-load.cpp)
+    llama_build(test-moss-tts-delay-forward.cpp)
 
     # build test-tokenizer-1-bpe target once and add many tests
     llama_build(test-tokenizer-1-bpe.cpp)
@@ -283,4 +284,3 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 
 llama_build_and_test(test-alloc.cpp)
 target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
-
