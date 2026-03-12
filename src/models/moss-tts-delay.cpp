@@ -10,7 +10,7 @@ public:
     void set_input(const llama_ubatch * ubatch) override {
         GGML_ASSERT(tokens != nullptr);
 
-        std::vector<llama_token> data(ubatch->n_tokens, 0);
+        data.resize(ubatch->n_tokens, 0);
         if (ubatch->token_audio != nullptr) {
             GGML_ASSERT(ubatch->n_token_audio == n_channels);
 
@@ -37,6 +37,7 @@ public:
 private:
     const uint32_t channel;
     const uint32_t n_channels;
+    std::vector<llama_token> data;
 };
 
 }
@@ -70,7 +71,6 @@ llm_build_moss_tts_delay::llm_build_moss_tts_delay(const llama_model & model, co
 
         res->add_input(std::move(inp_audio));
     }
-
     ggml_tensor * inp_pos = build_inp_pos();
     auto * inp_attn = build_attn_inp_kv();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
@@ -172,6 +172,7 @@ llm_build_moss_tts_delay::llm_build_moss_tts_delay(const llama_model & model, co
                 audio_logits->nb[1],
                 ggml_element_size(audio_logits) * (audio_logits->ne[0] - 1));
         invalid_audio_logits = ggml_clamp(ctx0, invalid_audio_logits, -INFINITY, -INFINITY);
+        invalid_audio_logits = ggml_cont(ctx0, invalid_audio_logits);
         audio_logits = ggml_set_2d(
                 ctx0, audio_logits, invalid_audio_logits,
                 audio_logits->nb[1],
