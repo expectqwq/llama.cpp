@@ -166,17 +166,6 @@ llm_build_moss_tts_delay::llm_build_moss_tts_delay(const llama_model & model, co
 
     for (uint32_t i = 0; i < hparams.n_vq; ++i) {
         ggml_tensor * audio_logits = build_lora_mm(model.output_audio[i], cur);
-        ggml_tensor * invalid_audio_logits = ggml_view_2d(
-                ctx0, audio_logits,
-                1, audio_logits->ne[1],
-                audio_logits->nb[1],
-                ggml_element_size(audio_logits) * (audio_logits->ne[0] - 1));
-        invalid_audio_logits = ggml_clamp(ctx0, invalid_audio_logits, -INFINITY, -INFINITY);
-        invalid_audio_logits = ggml_cont(ctx0, invalid_audio_logits);
-        audio_logits = ggml_set_2d(
-                ctx0, audio_logits, invalid_audio_logits,
-                audio_logits->nb[1],
-                ggml_element_size(audio_logits) * (audio_logits->ne[0] - 1));
         cb(audio_logits, "result_output_audio", i);
 
         logits = ggml_concat(ctx0, logits, audio_logits, 0);

@@ -250,6 +250,39 @@ static bool parse_meta_token(const llama_model * model, const char * key, llama_
     return true;
 }
 
+static int32_t moss_debug_steps_from_env() {
+    const char * raw = std::getenv("MOSS_TTS_DEBUG_STEPS");
+    if (raw == nullptr || raw[0] == '\0') {
+        return 0;
+    }
+
+    char * end = nullptr;
+    const long parsed = std::strtol(raw, &end, 10);
+    if (end == raw) {
+        return 0;
+    }
+    return (int32_t) std::max<long>(parsed, 0);
+}
+
+static size_t moss_prefill_chunk_from_env() {
+    const char * raw = std::getenv("MOSS_TTS_PREFILL_CHUNK");
+    if (raw == nullptr || raw[0] == '\0') {
+        return 16;
+    }
+
+    char * end = nullptr;
+    const long parsed = std::strtol(raw, &end, 10);
+    if (end == raw) {
+        return 16;
+    }
+    return (size_t) std::max<long>(parsed, 1);
+}
+
+static int32_t & moss_debug_step_counter() {
+    static int32_t counter = 0;
+    return counter;
+}
+
 static moss_delay_config moss_delay_config_from_model(const llama_model * model) {
     moss_delay_config cfg;
 
@@ -582,6 +615,58 @@ static std::vector<llama_token> moss_delay_step(
         return result;
     }
 
+    const int32_t debug_limit = moss_debug_steps_from_env();
+    const int32_t debug_step = moss_debug_step_counter();
+    const bool debug_this_step = debug_limit > 0 && debug_step < debug_limit;
+    if (debug_this_step) {
+        size_t text_nan = 0;
+        size_t text_inf = 0;
+        for (float v : text_logits) {
+            if (std::isnan(v)) {
+                ++text_nan;
+            } else if (std::isinf(v)) {
+                ++text_inf;
+            }
+        }
+        size_t audio_nan = 0;
+        size_t audio_inf = 0;
+        for (float v : audio_logits) {
+            if (std::isnan(v)) {
+                ++audio_nan;
+            } else if (std::isinf(v)) {
+                ++audio_inf;
+            }
+        }
+        const float raw_text0 = text_logits.empty() ? MOSS_NEG_INF : text_logits[0];
+        const float raw_text_gen =
+                ((size_t) cfg.audio_assistant_gen_slot_token_id < text_vocab)
+                ? text_logits[(size_t) cfg.audio_assistant_gen_slot_token_id]
+                : MOSS_NEG_INF;
+        const float raw_text_delay =
+                ((size_t) cfg.audio_assistant_delay_slot_token_id < text_vocab)
+                ? text_logits[(size_t) cfg.audio_assistant_delay_slot_token_id]
+                : MOSS_NEG_INF;
+        LOG("moss-debug step=%d pre text_vocab=%zu audio_vocab=%zu is_audio=%d time_step=%d audio_length=%d delayed_length=%lld\n",
+                debug_step,
+                text_vocab,
+                audio_vocab,
+                state.is_audio ? 1 : 0,
+                state.time_step,
+                state.audio_length,
+                (long long) state.delayed_length);
+        LOG("moss-debug step=%d raw text[0]=%.6f gen[%d]=%.6f delay[%d]=%.6f text_nan=%zu text_inf=%zu audio_nan=%zu audio_inf=%zu\n",
+                debug_step,
+                raw_text0,
+                (int) cfg.audio_assistant_gen_slot_token_id,
+                raw_text_gen,
+                (int) cfg.audio_assistant_delay_slot_token_id,
+                raw_text_delay,
+                text_nan,
+                text_inf,
+                audio_nan,
+                audio_inf);
+    }
+
     llama_token next_text = cfg.pad_token_id;
 
     if (state.delayed_length < (int64_t) n_vq) {
@@ -628,9 +713,39 @@ static std::vector<llama_token> moss_delay_step(
             scaled[(size_t) cfg.im_end_token_id] = MOSS_NEG_INF;
         }
 
+        if (debug_this_step) {
+            size_t finite_count = 0;
+            for (float v : scaled) {
+                if (std::isfinite(v)) {
+                    ++finite_count;
+                }
+            }
+            const float logit0 = !scaled.empty() ? scaled[0] : MOSS_NEG_INF;
+            const float logit_gen =
+                    ((size_t) cfg.audio_assistant_gen_slot_token_id < text_vocab)
+                    ? scaled[(size_t) cfg.audio_assistant_gen_slot_token_id]
+                    : MOSS_NEG_INF;
+            const float logit_delay =
+                    ((size_t) cfg.audio_assistant_delay_slot_token_id < text_vocab)
+                    ? scaled[(size_t) cfg.audio_assistant_delay_slot_token_id]
+                    : MOSS_NEG_INF;
+            LOG("moss-debug step=%d text-mask logit[0]=%.6f gen[%d]=%.6f delay[%d]=%.6f finite=%zu\n",
+                    debug_step,
+                    logit0,
+                    (int) cfg.audio_assistant_gen_slot_token_id,
+                    logit_gen,
+                    (int) cfg.audio_assistant_delay_slot_token_id,
+                    logit_delay,
+                    finite_count);
+        }
+
         next_text = moss_sample_token(
                 scaled, 1, text_vocab, rng, nullptr, 1.0f,
                 sampling_cfg.text_top_p, sampling_cfg.text_top_k, text_do_sample)[0];
+    }
+
+    if (debug_this_step) {
+        LOG("moss-debug step=%d text-picked next_text=%d\n", debug_step, (int) next_text);
     }
 
     if (next_text == cfg.audio_start_token_id) {
@@ -730,6 +845,9 @@ static std::vector<llama_token> moss_delay_step(
     }
 
     state.time_step += 1;
+    if (debug_this_step) {
+        moss_debug_step_counter() += 1;
+    }
     state.text_history.push_back(next_text);
     state.append_audio(next_audio);
 
@@ -985,21 +1103,33 @@ static llama_batch moss_batch_from_packed_rows(
     GGML_ASSERT(packed_ids.size() % cfg.packed_stride() == 0);
     GGML_ASSERT(start_frame + n_frames <= packed_ids.size() / cfg.packed_stride());
 
+    const bool disable_audio_input = []() {
+        const char * raw = std::getenv("MOSS_TTS_DISABLE_AUDIO_INPUT");
+        return raw != nullptr && raw[0] == '1';
+    }();
+
     llama_batch batch = llama_batch_init((int32_t) n_frames, 0, 1);
     batch.n_tokens = (int32_t) n_frames;
-    batch.n_token_audio = (int32_t) cfg.n_vq;
-    batch.token_audio = (llama_token *) std::malloc(sizeof(llama_token) * n_frames * cfg.n_vq);
-    if (batch.token_audio == nullptr) {
-        throw std::runtime_error("failed to allocate token_audio");
+    if (!disable_audio_input) {
+        batch.n_token_audio = (int32_t) cfg.n_vq;
+        batch.token_audio = (llama_token *) std::malloc(sizeof(llama_token) * n_frames * cfg.n_vq);
+        if (batch.token_audio == nullptr) {
+            throw std::runtime_error("failed to allocate token_audio");
+        }
+    } else {
+        batch.n_token_audio = 0;
+        batch.token_audio = nullptr;
     }
 
     for (size_t i = 0; i < n_frames; ++i) {
         const size_t row = (start_frame + i) * cfg.packed_stride();
         batch.token[i] = packed_ids[row + 0];
-        std::memcpy(
-                batch.token_audio + i * cfg.n_vq,
-                packed_ids.data() + row + 1,
-                sizeof(llama_token) * cfg.n_vq);
+        if (!disable_audio_input) {
+            std::memcpy(
+                    batch.token_audio + i * cfg.n_vq,
+                    packed_ids.data() + row + 1,
+                    sizeof(llama_token) * cfg.n_vq);
+        }
         batch.pos[i] = (llama_pos) (pos_start + i);
         batch.n_seq_id[i] = 1;
         batch.seq_id[i][0] = 0;
@@ -1046,6 +1176,14 @@ static bool moss_generate_from_ref(
 
     llama_model_params mparams = llama_model_default_params();
     mparams.use_mmap = true;
+    if (const char * raw_ngl = std::getenv("MOSS_TTS_N_GPU_LAYERS"); raw_ngl != nullptr && raw_ngl[0] != '\0') {
+        char * end = nullptr;
+        const long parsed = std::strtol(raw_ngl, &end, 10);
+        if (end != raw_ngl) {
+            mparams.n_gpu_layers = (int32_t) parsed;
+            LOG("moss-debug model n_gpu_layers=%d (from MOSS_TTS_N_GPU_LAYERS)\n", mparams.n_gpu_layers);
+        }
+    }
 
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mparams);
     if (model == nullptr) {
@@ -1063,16 +1201,25 @@ static bool moss_generate_from_ref(
         throw std::runtime_error("generation reference n_vq does not match model metadata");
     }
     cfg.audio_vocab_size = model_cfg.audio_vocab_size;
+    const int32_t debug_steps = moss_debug_steps_from_env();
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = std::max<uint32_t>((uint32_t) hdr.prompt_frames + (uint32_t) max_new_tokens + 8u, 64u);
     cparams.n_batch = std::max<uint32_t>((uint32_t) hdr.prompt_frames, 1u);
     cparams.n_ubatch = cparams.n_batch;
     cparams.n_seq_max = 1;
-    cparams.embeddings = false;
+    cparams.embeddings = debug_steps > 0;
     cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.type_k = GGML_TYPE_F32;
     cparams.type_v = GGML_TYPE_F32;
+    if (const char * raw = std::getenv("MOSS_TTS_OFFLOAD_KQV"); raw != nullptr && raw[0] == '0') {
+        cparams.offload_kqv = false;
+        LOG("moss-debug cparams.offload_kqv=false (from MOSS_TTS_OFFLOAD_KQV=0)\n");
+    }
+    if (const char * raw = std::getenv("MOSS_TTS_OP_OFFLOAD"); raw != nullptr && raw[0] == '0') {
+        cparams.op_offload = false;
+        LOG("moss-debug cparams.op_offload=false (from MOSS_TTS_OP_OFFLOAD=0)\n");
+    }
 
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (ctx == nullptr) {
@@ -1083,21 +1230,39 @@ static bool moss_generate_from_ref(
 
     llama_set_warmup(ctx, false);
     llama_set_causal_attn(ctx, true);
-    llama_set_embeddings(ctx, false);
+    llama_set_embeddings(ctx, debug_steps > 0);
 
     {
-        llama_batch batch = moss_batch_from_packed_rows(prompt_packed, 0, hdr.prompt_frames, cfg, 0, true);
-        const int ret = llama_decode(ctx, batch);
-        llama_batch_free(batch);
-        if (ret != 0) {
-            llama_free(ctx);
-            llama_model_free(model);
-            llama_backend_free();
-            throw std::runtime_error("prefill llama_decode failed: " + std::to_string(ret));
+        const size_t prefill_chunk = moss_prefill_chunk_from_env();
+        for (size_t start = 0; start < hdr.prompt_frames; start += prefill_chunk) {
+            const size_t n = std::min(prefill_chunk, (size_t) hdr.prompt_frames - start);
+            const bool output_last = (start + n == hdr.prompt_frames);
+            llama_batch batch = moss_batch_from_packed_rows(prompt_packed, start, n, cfg, start, output_last);
+            const int ret = llama_decode(ctx, batch);
+            llama_batch_free(batch);
+            if (ret != 0) {
+                llama_free(ctx);
+                llama_model_free(model);
+                llama_backend_free();
+                throw std::runtime_error("prefill llama_decode failed: " + std::to_string(ret));
+            }
         }
     }
 
     moss_delay_state state = moss_init_delay_state(prompt_packed, cfg);
+    if (debug_steps > 0) {
+        const llama_token last_prompt_text = prompt_packed.empty() ? -1 : prompt_packed[(hdr.prompt_frames - 1u) * cfg.packed_stride()];
+        LOG("moss-debug init: prompt_frames=%u last_prompt_text=%d audio_start=%d gen_slot=%d delay_slot=%d is_audio=%d audio_length=%d delayed_length=%lld\n",
+                hdr.prompt_frames,
+                (int) last_prompt_text,
+                (int) cfg.audio_start_token_id,
+                (int) cfg.audio_assistant_gen_slot_token_id,
+                (int) cfg.audio_assistant_delay_slot_token_id,
+                state.is_audio ? 1 : 0,
+                state.audio_length,
+                (long long) state.delayed_length);
+    }
+
     std::vector<llama_token> generated_packed;
     generated_packed.reserve((size_t) max_new_tokens * cfg.packed_stride());
 
@@ -1105,6 +1270,26 @@ static bool moss_generate_from_ref(
     moss_rng rng(seed);
 
     for (int32_t step = 0; step < max_new_tokens; ++step) {
+        if (debug_steps > 0 && step < debug_steps) {
+            const float * embd = llama_get_embeddings_ith(ctx, -1);
+            if (embd != nullptr) {
+                const int32_t n_embd = llama_model_n_embd(model);
+                size_t embd_nan = 0;
+                size_t embd_inf = 0;
+                for (int32_t i = 0; i < n_embd; ++i) {
+                    if (std::isnan(embd[i])) {
+                        ++embd_nan;
+                    } else if (std::isinf(embd[i])) {
+                        ++embd_inf;
+                    }
+                }
+                LOG("moss-debug step=%d embd[0]=%.6f embd_nan=%zu embd_inf=%zu\n",
+                        step, n_embd > 0 ? embd[0] : 0.0f, embd_nan, embd_inf);
+            } else {
+                LOG("moss-debug step=%d embd unavailable\n", step);
+            }
+        }
+
         const float * logits = llama_get_logits_ith(ctx, -1);
         if (logits == nullptr) {
             llama_free(ctx);
@@ -1120,6 +1305,19 @@ static bool moss_generate_from_ref(
 
         const std::vector<llama_token> next = moss_delay_step(
                 state, text_logits, audio_logits, sampling_cfg, cfg, rng);
+        if (debug_steps > 0 && step < debug_steps) {
+            const llama_token ch0 = next.size() > 1 ? next[1] : -1;
+            const llama_token ch1 = next.size() > 2 ? next[2] : -1;
+            LOG("moss-debug step=%d next_text=%d ch0=%d ch1=%d is_audio=%d audio_length=%d delayed_length=%lld is_stopping=%d\n",
+                    step,
+                    (int) next[0],
+                    (int) ch0,
+                    (int) ch1,
+                    state.is_audio ? 1 : 0,
+                    state.audio_length,
+                    (long long) state.delayed_length,
+                    state.is_stopping ? 1 : 0);
+        }
         generated_packed.insert(generated_packed.end(), next.begin(), next.end());
 
         llama_batch batch = moss_batch_from_packed_rows(
