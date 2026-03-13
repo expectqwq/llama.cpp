@@ -166,8 +166,6 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build(test-gbnf-validator.cpp)
     llama_build(test-moss-tts-delay-load.cpp)
     llama_build(test-moss-tts-delay-forward.cpp)
-    llama_build(test-moss-tts-delay-op-offload-repro.cpp)
-    llama_build(test-moss-tts-delay-op-offload-minimal.cpp)
 
     # build test-tokenizer-1-bpe target once and add many tests
     llama_build(test-tokenizer-1-bpe.cpp)
