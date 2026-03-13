@@ -264,20 +264,6 @@ static int32_t moss_debug_steps_from_env() {
     return (int32_t) std::max<long>(parsed, 0);
 }
 
-static size_t moss_prefill_chunk_from_env() {
-    const char * raw = std::getenv("MOSS_TTS_PREFILL_CHUNK");
-    if (raw == nullptr || raw[0] == '\0') {
-        return 16;
-    }
-
-    char * end = nullptr;
-    const long parsed = std::strtol(raw, &end, 10);
-    if (end == raw) {
-        return 16;
-    }
-    return (size_t) std::max<long>(parsed, 1);
-}
-
 static int32_t & moss_debug_step_counter() {
     static int32_t counter = 0;
     return counter;
@@ -1233,19 +1219,15 @@ static bool moss_generate_from_ref(
     llama_set_embeddings(ctx, debug_steps > 0);
 
     {
-        const size_t prefill_chunk = moss_prefill_chunk_from_env();
-        for (size_t start = 0; start < hdr.prompt_frames; start += prefill_chunk) {
-            const size_t n = std::min(prefill_chunk, (size_t) hdr.prompt_frames - start);
-            const bool output_last = (start + n == hdr.prompt_frames);
-            llama_batch batch = moss_batch_from_packed_rows(prompt_packed, start, n, cfg, start, output_last);
-            const int ret = llama_decode(ctx, batch);
-            llama_batch_free(batch);
-            if (ret != 0) {
-                llama_free(ctx);
-                llama_model_free(model);
-                llama_backend_free();
-                throw std::runtime_error("prefill llama_decode failed: " + std::to_string(ret));
-            }
+        llama_batch batch = moss_batch_from_packed_rows(
+                prompt_packed, 0, hdr.prompt_frames, cfg, 0, true);
+        const int ret = llama_decode(ctx, batch);
+        llama_batch_free(batch);
+        if (ret != 0) {
+            llama_free(ctx);
+            llama_model_free(model);
+            llama_backend_free();
+            throw std::runtime_error("prefill llama_decode failed: " + std::to_string(ret));
         }
     }
 
