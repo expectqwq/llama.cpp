@@ -157,7 +157,7 @@ def main() -> int:
             str(llama_bin),
             "-m",
             str(model_gguf),
-            "--generation-ref",
+            "--generation-input",
             str(generation_ref),
             "--max-new-tokens",
             str(args.max_new_tokens),

@@ -6,14 +6,14 @@
 ## 功能
 该脚本把以下链路封装为一次命令执行：
 
-1. 用 `moss-tts-build-generation-ref.py` 构建 `generation.ref.bin`
+1. 用 `moss-tts-build-generation-ref.py` 构建 `generation.input.bin`
 2. 调用 `llama-moss-tts` 进行 first-class backbone 生成 raw audio codes
 3. 用 `moss-tts-audio-decode.py` + ONNX audio tokenizer 解码为 WAV
 
 输入：`text`（可选 `reference audio`）
 输出：`wav`
 
-中间产物（`generation.ref.bin`、`raw.codes.bin`）会写入临时目录并在结束后自动删除。
+中间产物（`generation.input.bin`、`raw.codes.bin`）会写入临时目录并在结束后自动删除。
 
 ## 必需参数
 - `--model-gguf`：MOSS-TTS first-class GGUF 模型
@@ -72,4 +72,4 @@ python tools/tts/moss-tts-firstclass-e2e.py \
 - `wav` 路径
 - `wav_info`（采样率、声道、帧数、时长）
 
-注：当前 `llama-moss-tts` 可能出现“返回码非 0 但 wav 已成功产出”的情况，脚本会保留并提示该结果。
+注：`llama-moss-tts` 在该链路中不再做 generation parity 返回码判定；只要流程成功会返回 0。

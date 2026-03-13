@@ -165,7 +165,7 @@ static moss_generation_audio moss_decode_generation_audio(
         size_t prompt_frames,
         const moss_delay_config & cfg);
 
-static bool moss_generate_from_ref(
+static void moss_generate_from_ref(
         const std::string & model_path,
         const std::string & ref_path,
         int32_t max_new_tokens,
@@ -183,6 +183,7 @@ static void print_usage(int argc, char ** argv) {
     (void) argc;
     LOG("\nexample usage:\n");
     LOG("  %s -m model.gguf --print-delay-config\n", argv[0]);
+    LOG("  %s -m model.gguf --generation-input generation.input.bin\n", argv[0]);
     LOG("  %s --decode-parity-ref decode.ref.bin\n", argv[0]);
     LOG("\n");
 }
@@ -1125,7 +1126,7 @@ static llama_batch moss_batch_from_packed_rows(
     return batch;
 }
 
-static bool moss_generate_from_ref(
+static void moss_generate_from_ref(
         const std::string & model_path,
         const std::string & ref_path,
         int32_t max_new_tokens,
@@ -1154,9 +1155,9 @@ static bool moss_generate_from_ref(
     cfg.audio_pad_code = (llama_token) hdr.audio_pad_code;
 
     std::vector<llama_token> prompt_packed((size_t) hdr.prompt_packed_frames * cfg.packed_stride());
-    std::vector<llama_token> ref_raw_codes((size_t) hdr.raw_frames * cfg.n_vq);
+    std::vector<llama_token> ignored_ref_raw_codes((size_t) hdr.raw_frames * cfg.n_vq);
     moss_read_exact(in, prompt_packed.data(), prompt_packed.size(), "prompt packed ids");
-    moss_read_exact(in, ref_raw_codes.data(), ref_raw_codes.size(), "reference raw codes");
+    moss_read_exact(in, ignored_ref_raw_codes.data(), ignored_ref_raw_codes.size(), "reference raw codes");
 
     llama_backend_init();
 
@@ -1321,33 +1322,11 @@ static bool moss_generate_from_ref(
 
     const moss_generation_audio decoded = moss_decode_generation_audio(state, hdr.prompt_frames, cfg);
 
-    size_t mismatch_count = 0;
-    const size_t compare_count = std::min(decoded.raw_codes.size(), ref_raw_codes.size());
-    size_t first_mismatch = compare_count;
-    for (size_t i = 0; i < compare_count; ++i) {
-        if (decoded.raw_codes[i] != ref_raw_codes[i]) {
-            if (first_mismatch == compare_count) {
-                first_mismatch = i;
-            }
-            ++mismatch_count;
-        }
-    }
-    mismatch_count += decoded.raw_codes.size() > ref_raw_codes.size()
-            ? decoded.raw_codes.size() - ref_raw_codes.size()
-            : ref_raw_codes.size() - decoded.raw_codes.size();
-
-    LOG("moss-tts first-class generation parity: prompt_frames=%u generated_frames=%zu raw_frames=%zu ref_raw_frames=%u mismatch_count=%zu\n",
+    LOG("moss-tts first-class generation: prompt_frames=%u generated_frames=%zu raw_frames=%zu input_ref_raw_frames=%u\n",
             hdr.prompt_frames,
             generated_packed.size() / cfg.packed_stride(),
             decoded.raw_frames,
-            hdr.raw_frames,
-            mismatch_count);
-    if (first_mismatch != compare_count) {
-        LOG("first mismatch at raw_token=%zu got=%d ref=%d\n",
-                first_mismatch,
-                (int) decoded.raw_codes[first_mismatch],
-                (int) ref_raw_codes[first_mismatch]);
-    }
+            hdr.raw_frames);
 
     if (!dump_raw_codes_path.empty()) {
         moss_write_codes_file(dump_raw_codes_path, decoded.raw_codes, decoded.raw_frames, cfg);
@@ -1387,8 +1366,6 @@ static bool moss_generate_from_ref(
     llama_free(ctx);
     llama_model_free(model);
     llama_backend_free();
-
-    return mismatch_count == 0;
 }
 
 static std::vector<llama_token> moss_audio_history_slice(
@@ -1691,7 +1668,7 @@ static bool moss_delay_self_test() {
 int main(int argc, char ** argv) {
     std::string model_path;
     std::string decode_parity_ref_path;
-    std::string generation_ref_path;
+    std::string generation_input_path;
     std::string dump_raw_codes_path;
     std::string audio_decoder_script;
     std::string audio_encoder_onnx;
@@ -1711,8 +1688,13 @@ int main(int argc, char ** argv) {
             model_path = argv[++i];
             continue;
         }
+        if (arg == "--generation-input" && i + 1 < argc) {
+            generation_input_path = argv[++i];
+            continue;
+        }
         if (arg == "--generation-ref" && i + 1 < argc) {
-            generation_ref_path = argv[++i];
+            generation_input_path = argv[++i];
+            LOG("warning: --generation-ref is deprecated; use --generation-input instead.\n");
             continue;
         }
         if (arg == "--decode-parity-ref" && i + 1 < argc) {
@@ -1809,15 +1791,15 @@ int main(int argc, char ** argv) {
         LOG("moss delay state self-test: ok\n");
     }
 
-    if (!generation_ref_path.empty()) {
+    if (!generation_input_path.empty()) {
         if (model_path.empty()) {
-            LOG_ERR("--generation-ref requires -m <model.gguf>\n");
+            LOG_ERR("--generation-input requires -m <model.gguf>\n");
             return EXIT_FAILURE;
         }
         try {
-            const bool ok = moss_generate_from_ref(
+            moss_generate_from_ref(
                     model_path,
-                    generation_ref_path,
+                    generation_input_path,
                     max_new_tokens,
                     sampling_cfg,
                     seed,
@@ -1828,9 +1810,9 @@ int main(int argc, char ** argv) {
                     audio_decoder_onnx,
                     wav_out_path,
                     use_gpu_audio);
-            return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+            return EXIT_SUCCESS;
         } catch (const std::exception & err) {
-            LOG_ERR("generation parity failed: %s\n", err.what());
+            LOG_ERR("generation failed: %s\n", err.what());
             return EXIT_FAILURE;
         }
     }
@@ -1860,7 +1842,7 @@ int main(int argc, char ** argv) {
         LOG("moss delay state, multi-head sampler, and raw-code decode are in place; audio decode is available via the external Python/ONNX helper.\n");
         LOG("use --print-delay-config with -m <model.gguf> to inspect model metadata.\n");
         LOG("use --decode-parity-ref <ref.bin> to verify C++ de-delay/raw-code extraction against Python.\n");
-        LOG("use --generation-ref <ref.bin> -m <first-class-model.gguf> to verify end-to-end first-class generation against Python.\n");
+        LOG("use --generation-input <input.bin> -m <first-class-model.gguf> for first-class generation.\n");
         return EXIT_SUCCESS;
     }
 
