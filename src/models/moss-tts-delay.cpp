@@ -71,6 +71,7 @@ llm_build_moss_tts_delay::llm_build_moss_tts_delay(const llama_model & model, co
         res->add_input(std::move(inp_audio));
     }
 
+    
     ggml_tensor * inp_pos = build_inp_pos();
     auto * inp_attn = build_attn_inp_kv();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
