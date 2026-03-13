@@ -96,6 +96,8 @@ int main(int argc, char ** argv) {
 
     llama_model_params mparams = llama_model_default_params();
     mparams.use_mmap = true;
+    // Keep this parity test deterministic and avoid multi-backend split-input limits.
+    mparams.n_gpu_layers = 0;
 
     llama_model * model = llama_model_load_from_file(argv[1], mparams);
     if (model == nullptr) {

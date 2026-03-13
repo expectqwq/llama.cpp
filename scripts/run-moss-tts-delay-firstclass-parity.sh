@@ -9,7 +9,7 @@ set -euo pipefail
 # - compares raw audio codes exactly
 # - decodes both sides to wav through the same ONNX audio tokenizer
 
-WORKDIR="${WORKDIR:-$HOME/moss-tts-delay-firstclass}"
+WORKDIR="/home/taoji/data/zlwang/workwork"
 CONDA_ENV="${CONDA_ENV:-moss-tts-firstclass}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
 N_JOBS="${N_JOBS:-$(nproc)}"
@@ -63,6 +63,7 @@ need_cmd git
 need_cmd cmake
 need_cmd conda
 
+export PS1="${PS1:-}"
 source "$(conda info --base)/etc/profile.d/conda.sh"
 
 if ! conda env list | awk '{print $1}' | grep -qx "$CONDA_ENV"; then

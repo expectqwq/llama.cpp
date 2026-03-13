@@ -71,9 +71,17 @@ def main() -> int:
         )
         prompt_len = input_ids.shape[0]
 
-        pipeline.backbone.clear_kv()
-        pipeline._prefill(input_ids)
-        generation_ids = pipeline._autoregressive_loop(input_ids, config.max_new_tokens)
+        backbone = pipeline.backbone
+        embedder = pipeline.embedder
+        lm_heads = pipeline.lm_heads
+        if backbone is None or embedder is None or lm_heads is None:
+            raise RuntimeError("pipeline low-memory mode is not supported by this export script")
+
+        backbone.clear_kv()
+        pipeline._prefill(input_ids, backbone, embedder)
+        generation_ids = pipeline._autoregressive_loop(
+            input_ids, config.max_new_tokens, backbone, embedder, lm_heads
+        )
         _text, audio_codes = parse_generation_output(pipeline.tokenizer, generation_ids, prompt_len)
 
         if args.output_wav:

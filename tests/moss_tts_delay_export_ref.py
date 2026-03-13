@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import os
 import struct
 import sys
 import types
@@ -9,14 +8,23 @@ from pathlib import Path
 import numpy as np
 import torch
 import transformers
-from safetensors.torch import load_file
 
-if "transformers.initialization" not in sys.modules:
+# Keep compatibility with environments that do not provide
+# transformers.initialization (older transformers releases).
+try:
+    from transformers import initialization as _hf_init  # noqa: F401
+except Exception:
     import torch.nn.init as nn_init
+
+    def _guard_torch_init_functions():
+        def _decorator(fn):
+            return fn
+        return _decorator
 
     shim = types.SimpleNamespace(
         normal_=nn_init.normal_,
         zeros_=nn_init.zeros_,
+        guard_torch_init_functions=_guard_torch_init_functions,
     )
     transformers.initialization = shim
     sys.modules["transformers.initialization"] = shim
@@ -61,20 +69,7 @@ def main() -> int:
     out_path = sys.argv[2]
 
     config = MossTTSDelayConfig.from_pretrained(model_dir)
-    orig_get_input_embeddings = MossTTSDelayModel.get_input_embeddings
-    orig_tie_weights = MossTTSDelayModel.tie_weights
-
-    MossTTSDelayModel.get_input_embeddings = lambda self: self.language_model.get_input_embeddings()
-    MossTTSDelayModel.tie_weights = lambda self: None
-    try:
-        model = MossTTSDelayModel(config).eval()
-        state_dict = load_file(os.path.join(model_dir, "model.safetensors"), device="cpu")
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        if missing or unexpected:
-            raise RuntimeError(f"state_dict mismatch: missing={missing} unexpected={unexpected}")
-    finally:
-        MossTTSDelayModel.get_input_embeddings = orig_get_input_embeddings
-        MossTTSDelayModel.tie_weights = orig_tie_weights
+    model = MossTTSDelayModel.from_pretrained(model_dir, local_files_only=True).eval()
 
     n_tokens = 4
     text_ids = build_text_ids(n_tokens, config.language_config.vocab_size)
@@ -93,7 +88,7 @@ def main() -> int:
         axis=0,
     ).astype(np.float32, copy=False)
 
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "wb") as f:
         f.write(struct.pack("<6I", REF_MAGIC, REF_VERSION, n_tokens, config.n_vq, ref_embd.shape[0], ref_logits.shape[0]))
         f.write(text_ids.astype(np.int32, copy=False).tobytes())
