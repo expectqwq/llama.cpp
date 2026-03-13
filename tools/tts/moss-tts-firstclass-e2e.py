@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--text-temperature", type=float, default=1.5)
     parser.add_argument("--audio-temperature", type=float, default=1.7)
-    parser.add_argument("--n-gpu-layers", type=int, default=int(os.getenv("MOSS_TTS_N_GPU_LAYERS", "1")))
+    parser.add_argument("--n-gpu-layers", type=int, default=int(os.getenv("MOSS_TTS_N_GPU_LAYERS", "-1")))
     parser.add_argument("--python-bin", default=sys.executable)
     parser.add_argument("--llama-bin", default="")
     parser.add_argument("--build", action="store_true", help="Build llama-moss-tts before running")

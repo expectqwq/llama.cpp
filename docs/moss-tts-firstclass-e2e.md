@@ -28,7 +28,7 @@
 - `--text-temperature`：默认 `1.5`
 - `--audio-temperature`：默认 `1.7`
 - `--max-new-tokens`：默认 `512`
-- `--n-gpu-layers`：默认读取 `MOSS_TTS_N_GPU_LAYERS`，未设置时默认 `1`
+- `--n-gpu-layers`：默认读取 `MOSS_TTS_N_GPU_LAYERS`，未设置时默认 `-1`
 - `--python-bin`：指定 Python 解释器
 - `--audio-decoder-cpu`：强制 ONNX 解码走 CPU
 - `--cpu-audio-encode`：参考音频编码走 CPU
