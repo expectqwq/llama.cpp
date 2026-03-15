@@ -10,6 +10,13 @@
 
 LLM inference in C/C++
 
+> [!IMPORTANT]
+> This fork includes a first-class MOSS-TTS end-to-end pipeline built on top of `llama.cpp`.
+> Start here:
+> - English guide: [docs/moss-tts-firstclass-e2e.md](docs/moss-tts-firstclass-e2e.md)
+> - 中文指南: [docs/moss-tts-firstclass-e2e_zh.md](docs/moss-tts-firstclass-e2e_zh.md)
+> - Main runner: [`tools/tts/moss-tts-firstclass-e2e.py`](tools/tts/moss-tts-firstclass-e2e.py)
+
 ## Recent API changes
 
 - [Changelog for `libllama` API](https://github.com/ggml-org/llama.cpp/issues/9289)
