@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import struct
 import sys
 from pathlib import Path
@@ -11,6 +12,20 @@ import numpy as np
 
 REF_MAGIC = 0x4652474D  # "MGRF"
 REF_VERSION = 1
+
+
+def resolve_moss_tts_dir() -> Path:
+    env_dir = os.getenv("MOSS_TTS_DIR") or os.getenv("MOSS_TTS_ROOT")
+    if env_dir:
+        path = Path(env_dir).expanduser().resolve()
+    else:
+        path = Path(__file__).resolve().parents[3] / "MOSS-TTS"
+
+    if not path.is_dir():
+        raise FileNotFoundError(
+            f"MOSS-TTS repo not found: {path}. Set MOSS_TTS_DIR to the MOSS-TTS checkout root."
+        )
+    return path
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,8 +79,7 @@ def _read_reference_codes(args: argparse.Namespace) -> np.ndarray | None:
 def main() -> int:
     args = parse_args()
 
-    workroot = Path(__file__).resolve().parents[3]
-    sys.path.insert(0, str(workroot / "MOSS-TTS"))
+    sys.path.insert(0, str(resolve_moss_tts_dir()))
 
     from moss_tts_delay.llama_cpp._constants import AUDIO_PAD_CODE
     from moss_tts_delay.llama_cpp.processor import Tokenizer, build_generation_prompt

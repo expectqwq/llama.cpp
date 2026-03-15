@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import struct
 import sys
 import wave
@@ -10,8 +11,22 @@ from pathlib import Path
 
 import numpy as np
 
-WORKROOT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(WORKROOT / "MOSS-TTS"))
+
+def resolve_moss_tts_dir() -> Path:
+    env_dir = os.getenv("MOSS_TTS_DIR") or os.getenv("MOSS_TTS_ROOT")
+    if env_dir:
+        path = Path(env_dir).expanduser().resolve()
+    else:
+        path = Path(__file__).resolve().parents[3] / "MOSS-TTS"
+
+    if not path.is_dir():
+        raise FileNotFoundError(
+            f"MOSS-TTS repo not found: {path}. Set MOSS_TTS_DIR to the MOSS-TTS checkout root."
+        )
+    return path
+
+
+sys.path.insert(0, str(resolve_moss_tts_dir()))
 
 from moss_tts_delay.llama_cpp._constants import N_VQ, SAMPLE_RATE  # noqa: E402
 
